@@ -27,12 +27,12 @@ inline void twoDimWrite(std::vector<float> &tensor, int &x, int &y, const int &s
 // Step #2: Implement Read/Write Accessors for a 4D Tensor
 inline float fourDimRead(std::vector<float> &tensor, int &x, int &y, int &z, int &b, 
         const int &sizeX, const int &sizeY, const int &sizeZ) {
-    return 0.0;
+    return tensor[(x * sizeX * sizeY * sizeZ) + (y * sizeY * sizeZ) + (z * sizeZ) + b];
 }
 
 inline void fourDimWrite(std::vector<float> &tensor, int &x, int &y, int &z, int &b, 
         const int &sizeX, const int &sizeY, const int &sizeZ, float &val) {
-    return; 
+    tensor[(x * sizeX * sizeY * sizeZ) + (y * sizeY * sizeZ) + (z * sizeZ) + b] = val;
 }
 
 // DO NOT EDIT THIS FUNCTION //
@@ -88,7 +88,53 @@ torch::Tensor myNaiveAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
 
     //Format QK_t Tensor into a 2D vector.
     std::vector<float> QK_t = formatTensor(QK_tTensor);
-    
+
+    // (B, H, N, d) @ (B, H, d, N) --> (B, H, N, N)
+
+    for (int batch = 0; batch < B; batch++) {
+        for (int head = 0; head < H; head++) {
+            for (int i = 0; i < N; i++) {
+                for (int j = 0; j < N; j++) {
+                    float out = 0;
+                    for (int k = 0; k < d; k++) {
+                        float q_val = fourDimRead(Q, batch, head, i, k, H, N, d);
+                        float k_val = fourDimRead(K, batch, head, j, k, H, N, d);
+                        out += q_val * k_val;
+                    }
+                    twoDimWrite(QK_t, i, j, N, out);
+                }
+            }
+
+            for (int row = 0; row < N; row++) {
+                float tot = 0;
+                for (int col = 0; col < N; col++) {
+                    float exp_val = exp(twoDimRead(QK_t, row, col, N));
+                    tot += exp_val;
+                    twoDimWrite(QK_t, row, col, N, exp_val);
+                }
+
+                for (int col = 0; col < N; col++) {
+                    float exp_val = twoDimRead(QK_t, row, col, N) / tot;
+                    twoDimWrite(QK_t, row, col, N, exp_val);
+                }
+
+            }
+
+            // (N, N) @ (N, d) --> (N, d)
+            for (int row = 0; row < N; row++) {
+                for (int col = 0; col < d; col++) { 
+                    float out = 0;
+                    for (int sel = 0; sel < N; sel++) {
+                        float a_val = twoDimRead(QK_t, row, sel, N);
+                        float v_val = fourDimRead(V, batch, head, sel, col, H, N, d);
+                        out += a_val * v_val;
+                    }
+                    fourDimWrite(O, batch, head, row, col, H, N, d, out);
+                }
+            }
+        }
+    }
+   
     /* Here is an example of how to read/write 0's to  Q (B, H, N, d) using the 4D accessors
 
         //loop over Batch Size
@@ -153,6 +199,79 @@ torch::Tensor myUnfusedAttentionBlocked(torch::Tensor QTensor, torch::Tensor KTe
     std::vector<float> QK_t = formatTensor(QK_tTensor);
 
     // -------- YOUR CODE HERE  -------- //
+    // NOTE: what are the right units here? I think bytes
+    int cache_line_size = 64;
+    int block_size = cache_line_size / sizeof(float); 
+
+    // printf("B: %d H: %d N: %d d: %d\n", B, H, N, d);
+
+    for (int batch = 0; batch < B; batch++) {
+        for (int head = 0; head < H; head++) {
+            // compute QK_t
+
+            std::fill(QK_t.begin(), QK_t.end(), 0.0);
+            // (N, d) @ (d, N) --> (N, N) N.B we are operating on K in col-major manner
+            for (int row_block = 0; row_block < N; row_block+=block_size) {
+                for (int col_block = 0; col_block < N; col_block += block_size) {
+                    for (int sel_block = 0; sel_block < d; sel_block += block_size) {
+                        for (int row = row_block; row < std::min(N, row_block + block_size); row++) {
+                            for (int col = col_block; col < std::min(N, col_block + block_size); col++) {
+                                float out = twoDimRead(QK_t, row, col, N); // NOTE: is QK_t initialised to zero?
+
+                                for (int sel = sel_block; sel < std::min(d, sel_block + block_size); sel++) {
+                                    // printf("attention on batch: %d head: %d row: %d col: %d sel: %d \n", batch, head, row, col, sel);
+                                    float q_val = fourDimRead(Q, batch, head, row, sel, H, N, d);
+                                    float k_val = fourDimRead(K, batch, head, col, sel, H, N, d);
+                                    out += q_val * k_val;
+                                }
+
+                                twoDimWrite(QK_t, row, col, N, out);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // compute softmax
+            for (int row = 0; row < N; row++) {
+                float tot = 0;
+                for (int col = 0; col < N; col++) {
+                    float exp_val = exp(twoDimRead(QK_t, row, col, N));
+                    tot += exp_val;
+                    twoDimWrite(QK_t, row, col, N, exp_val);
+                }
+
+                for (int col = 0; col < N; col++) {
+                    float exp_val = twoDimRead(QK_t, row, col, N) / tot;
+                    twoDimWrite(QK_t, row, col, N, exp_val);
+                }
+            }
+
+            // compute O
+
+            // (N, N) @ (N, d) -> (N, d)
+            // NOTE: would it be better to compute the transpose of QK_t above so we can access it col-major?
+            for (int row_block = 0; row_block < N; row_block += block_size) {
+                for (int col_block = 0; col_block < d; col_block += block_size) {
+                    for (int sel_block = 0; sel_block < N; sel_block += block_size) {
+                        for (int row = row_block; row < std::min(N, row_block + block_size); row++) {
+                            for (int col = col_block; col < std::min(d, col_block + block_size); col++) {
+
+                                float out = fourDimRead(O, batch, head, row, col, H, N, d);
+                                for (int sel = sel_block; sel < std::min(N, sel_block + block_size); sel++) {
+                                    float atten_val = twoDimRead(QK_t, row, sel, N); 
+                                    float v_val = fourDimRead(V, batch, head, sel, col, H, N, d); // I think this must be a bit wrong because we're fucking the cache lines
+                                    out += atten_val * v_val;
+                                }
+                                fourDimWrite(O, batch, head, row, col, H, N, d, out);
+                            }
+                        }
+                    }
+                }
+            }
+
+        }
+    }
 
     // DO NOT EDIT THIS RETURN STATEMENT //
     // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
