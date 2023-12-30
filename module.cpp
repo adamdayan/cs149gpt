@@ -307,18 +307,40 @@ torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     // -------- YOUR CODE HERE  -------- //
     // We give you a template of the first three loops for your convenience
     //loop over batch
-    for (int b = 0; b < B; b++){
+    #pragma omp parallel for collapse(3)
+    for (int batch = 0; batch < B; batch++){
 
         //loop over heads
-        for (int h = 0; h < H; h++){
-            for (int i = 0; i < N ; i++){
+        for (int head = 0; head < H; head++){
+            for (int row = 0; row < N ; row++){
 
 		// YRow is moved inside so each OpenMP thread gets a local copy.
                 at::Tensor ORowTensor = temp.index({torch::indexing::Slice(omp_get_thread_num(), torch::indexing::None)});      
                 std::vector<float> ORow = formatTensor(ORowTensor);
 		//YOUR CODE HERE
+                float row_sum = 0;
+                for (int col = 0; col < N; col++) {
+                    float out = 0;
+                    for (int sel = 0; sel < d; sel++) {
+                        float q_val = fourDimRead(Q, batch, head, row, sel, H, N, d);
+                        float k_val = fourDimRead(K, batch, head, col, sel, H, N, d);
+                        out += q_val * k_val;
+                    }
+                    out = exp(out);
+                    row_sum += out;
+                    ORow[col] = out; 
+                }
+
+                for (int col = 0; col < d; col++) {
+                    float out = 0;
+                    for (int sel = 0; sel < N; sel++) {
+                        float v_val = fourDimRead(V, batch, head, sel, col, H, N, d);
+                        out += (ORow[sel]/row_sum) * v_val;
+                    }
+                    fourDimWrite(O, batch, head, row, col, H, N, d, out);
+                }
             }
-	}
+	    }
     }
 	    
 	
@@ -331,6 +353,7 @@ torch::Tensor myFusedAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
 // ---------------------------------------------------------- //
 //                PART 4: FLASH ATTENTION 		      //
 // ---------------------------------------------------------- //
+
 
 torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, torch::Tensor VTensor,
                torch::Tensor QiTensor, torch::Tensor KjTensor, torch::Tensor VjTensor,
@@ -366,13 +389,71 @@ torch::Tensor myFlashAttention(torch::Tensor QTensor, torch::Tensor KTensor, tor
     std::vector<float> lij = formatTensor(LijTensor);
     std::vector<float> lnew = formatTensor(LnewTensor);
 
+    int t_idx = 5;
+
     // -------- YOUR CODE HERE  -------- //
+    printf("B: %d H: %d N: %d d: %d Br: %d Bc: %d\n", B, H, N, d, Br, Bc);
+    for (int batch = 0; batch < B; batch++) {
+        for (int head = 0; head < H; head++) {
+
+            for (int col_block = 0; col_block < N; col_block+=Bc) {
+                for (int row_block = 0; row_block < N; row_block += Br) {
+
+                    for (int col = col_block; col < std::min(col_block + Bc, N); col++) {
+                        for (int row = row_block; row < std::min(row_block + Br, N); row++) {
+                            float out = 0;
+                            // compute QKt
+                            for (int sel = 0; sel < d; sel++) {
+                                float q_val = fourDimRead(Q, batch, head, row, sel, H, N, d);
+                                float k_val = fourDimRead(K, batch, head, col, sel, H, N, d);
+                                out += q_val * k_val;
+                            }
+                            float exp_out = exp(out);
+                            int r_idx = row - row_block;
+                            int c_idx = col - col_block;
+                            twoDimWrite(Pij, r_idx, c_idx, Bc, exp_out);
+                        }
+                    }
+
+
+                    for (int r_idx = 0; r_idx < std::min(Br, N - row_block); r_idx++) {
+                        float row_sum = 0;
+                        for (int c_idx = 0; c_idx < std::min(Bc, N - col_block); c_idx++) {
+                            row_sum += twoDimRead(Pij, r_idx, c_idx, Bc);
+                        }
+
+                        int row = r_idx + row_block;
+                        float l_old = l[row];
+                        float l_new = l_old + row_sum;
+
+                        for (int c_idx = 0; c_idx < d; c_idx++) {
+                            float out = 0;
+                            for (int sel = 0; sel < std::min(Bc, N - col_block); sel++) {
+                                float pij_val = twoDimRead(Pij, r_idx, sel, Bc);
+                                int row = sel + col_block;
+                                float v_val = fourDimRead(V, batch, head, row, c_idx, H, N, d); 
+                                out += pij_val * v_val;
+                            }
+                            float o_val = fourDimRead(O, batch, head, row, c_idx, H, N, d);
+                            o_val *= l_old;
+                            o_val += out;
+                            o_val /= l_new;
+                            fourDimWrite(O, batch, head, row, c_idx, H, N, d, o_val);
+                            l[row] = l_new;
+                        }
+                    }
+
+                }
+            }
+
+            std::fill(l.begin(), l.end(), 0);
+        }
+    }
 
     // DO NOT EDIT THIS RETURN STATEMENT //
     // It formats your C++ Vector O back into a Tensor of Shape (B, H, N, d) and returns it //
     return torch::from_blob(O.data(), {B, H, N, d}, torch::TensorOptions().dtype(torch::kFloat32)).clone();
 }
-
 
 /* DO NOT EDIT THESE BINDINGS */
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
